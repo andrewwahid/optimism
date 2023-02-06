@@ -1724,6 +1724,104 @@ func (s *PublicTransactionPoolAPI) SendRawTransaction(ctx context.Context, encod
 	return SubmitTransaction(ctx, s.b, tx)
 }
 
+// SendRawTransactionConditional will add the signed transaction to the transaction pool only if options knownAccounts conditions are satisfied.
+// The sender is responsible for signing the transaction and using the correct nonce.
+func (s *PublicTransactionPoolAPI) SendRawTransactionConditional(ctx context.Context, encodedTx hexutil.Bytes, options map[string]interface{}) (common.Hash, error) {
+	tx := new(types.Transaction)
+	if err := rlp.DecodeBytes(encodedTx, tx); err != nil {
+		return common.Hash{}, err
+	}
+
+	if s.b.IsSyncing() {
+		return common.Hash{}, errors.New("Cannot send raw transaction while syncing")
+	}
+
+	//
+	state, _, err := s.b.StateAndHeaderByNumberOrHash(ctx, rpc.BlockNumberOrHashWithNumber(rpc.LatestBlockNumber))
+	if state == nil || err != nil {
+		return common.Hash{}, err
+	}
+	//
+	knownAccounts, ok := options["knownAccounts"].(map[string]interface{})
+	if !ok {
+		return common.Hash{}, fmt.Errorf("knownAccounts in not properly formatted")
+	}
+	var byteArray []byte
+	for key, value := range knownAccounts {
+		byteArray, err = hexutil.Decode(key)
+		if err != nil {
+			return common.Hash{}, err
+		}
+		account := common.BytesToAddress(byteArray)
+		switch value.(type) {
+		case string:
+			byteArray, err = hexutil.Decode(value.(string))
+			if err != nil {
+				return common.Hash{}, err
+			}
+			expectedStorageHash := common.BytesToHash(byteArray)
+			//
+			storageTrie := state.StorageTrie(account)
+			storageHash := types.EmptyRootHash
+			// if we have a storageTrie, (which means the slot exists), we can update the storagehash
+			if storageTrie != nil {
+				storageHash = storageTrie.Hash()
+			}
+			if storageHash != expectedStorageHash {
+				return common.Hash{}, fmt.Errorf("conditions not satisifed for account %s storage root hash", account)
+			}
+		case map[string]interface{}:
+			for slot, value := range value.(map[string]interface{}) {
+				value, ok := value.(string)
+				if !ok {
+					return common.Hash{}, fmt.Errorf("conditional map invalid formatting at account %s", account)
+				}
+				//
+				byteArray, err = hexutil.Decode(value)
+				if err != nil {
+					return common.Hash{}, err
+				}
+				expectedStorageValue := common.BytesToHash(byteArray)
+				//
+				byteArray, err = hexutil.Decode(slot)
+				if err != nil {
+					return common.Hash{}, err
+				}
+				slotHash := common.BytesToHash(byteArray)
+				//
+				storageValue := state.GetState(account, slotHash)
+				if storageValue != expectedStorageValue {
+					return common.Hash{}, fmt.Errorf("conditions not satisifed for account %s storage slot %s", account, slotHash)
+				}
+			}
+		default:
+			return common.Hash{}, fmt.Errorf("conditional map invalid formatting at account %s", account)
+		}
+	}
+
+	if s.b.IsVerifier() {
+		sequencerURL := s.b.SequencerClientHttp()
+		if sequencerURL == "" {
+			return common.Hash{}, errNoSequencerURL
+		}
+		client, err := dialSequencerClientWithTimeout(ctx, sequencerURL)
+		if err != nil {
+			return common.Hash{}, err
+		}
+		err = client.SendTransaction(context.Background(), tx)
+		if err != nil {
+			return common.Hash{}, err
+		}
+		return tx.Hash(), nil
+	}
+
+	// L1Timestamp and L1BlockNumber will be set right before execution
+	txMeta := types.NewTransactionMeta(nil, 0, nil, types.QueueOriginSequencer, nil, nil, encodedTx)
+	tx.SetTransactionMeta(txMeta)
+
+	return SubmitTransaction(ctx, s.b, tx)
+}
+
 // Sign calculates an ECDSA signature for:
 // keccack256("\x19Ethereum Signed Message:\n" + len(message) + message).
 //
